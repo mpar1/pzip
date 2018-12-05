@@ -1,0 +1,3 @@
+read takes 0.000007 sec
+compress take 0.000000 sec
+write take 0.000000 sec
