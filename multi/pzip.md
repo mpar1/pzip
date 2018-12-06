@@ -87,6 +87,19 @@ Data buf (only 2, one per C thread)
 - If everything has been written out, sends a signal to **M** and returns.
 
 
+### Random ideas:
+- use mmap() to read files! but how? Only one mmap() per entire process, or one per **C** thread? What's the overhead of mmap?
+    - Here's an answer from [SO](https://stackoverflow.com/questions/14856319/overhead-of-reserving-address-space-using-mmap). Seems that best to stick with using one mmap() for the entire process.
+
+        > If your application is an multi-threaded program. You should avoid concurrent calls to mmap. That is because the address space is protected by a reader-writer lock and the mmap always takes the writer lock. mmap latency will be orders of magnitude greater in this case.
+        > 
+        > Moreover, mmap only create the mapping but not the page table. Pages are allocated in the page fault handler when being touched. Page fault handler would take the reader lock that protects address space and can also affects mmap performance.
+        >
+        > In this case, you should always try to reuse your large array instead of munmap it and mmap again. (Avoid pagefaults)
+
+
+- madvise(MADV_SEQUENTIAL) to tell the OS that reads will be strictly sequential (one advice per **C** thread?).
+
 ## ? N+M threads: N compressors, M writers
 
 It is even possible to have multiple writers? No. Writes can only be performed serially, as later compressed data can depend on what comes before it.
