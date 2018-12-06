@@ -1,4 +1,7 @@
 #include <stdio.h>
+#include <fcntl.h> // open
+#include <sys/mman.h> // mmap
+#include <unistd.h> // close
 #include <stdint.h> // portable int types
 #include <assert.h> // assert
 #include <stdlib.h> // exit
@@ -6,19 +9,20 @@
 #include <time.h> // for benchmarking
 
 
-// #define WRITE_READABLE // write compressed data in a human readable format
-
 /* Wrapper functions around the standard IO routines */
 FILE* Fopen(const char* filename);
 size_t Fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
 size_t Fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);
 void Fclose(FILE* stream);
 
-void write_out(uint32_t count, unsigned char ch);
+void write_out(uint32_t count, unsigned char ch, FILE* out);
 
 #define MAX_COUNT 0x80000000
 
-#define STATS_FILE "my_stats.txt"
+#define TIMING_FILE "./stats/mmap.txt"
+#define OUT_FILE "./mmap_out"
+#define WRITE_TO_FILE 0
+// #define ENABLE_TIMING 0
 
 /* compress the characters from a given input file stream */
 // void compress(FILE* infile);
@@ -46,44 +50,51 @@ int main( int argc, const char* argv[] )
 void compress(int fd)
 // void compress(FILE* infile)
 {
+    #ifdef ENABLE_TIMING
+        FILE* timing = fopen(TIMING_FILE, "w");
+    #endif
 
+    #ifdef WRITE_TO_FILE
+        FILE* out = fopen(OUT_FILE, "w");
+    #endif
+	
 	struct stat stat_buf;
+    fstat(fd, &stat_buf);
+    uint64_t size = stat_buf.st_size;
+	char* start_addr = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    assert(start_addr != MAP_FAILED);
 
-	fstat(fd, &stat_buf);
-	size_t size = stat_buf.st_size;
-
-	// void *mmap(void *addr, size_t length, int prot, int flags,
-    //               int fd, off_t offset);
-	char* start_addr = mmap(NULL, size, PROT_READ, MAP_POPULATE, fd, 0);
-
-
-	uint32_t count = 0;
     unsigned char prev_ch = -1;
     unsigned char ch;
-    size_t rc;
 
+    #ifdef ENABLE_TIMING
     time_t s,e;
     double read_time = 0.0;
     double compress_time = 0.0;
     double write_time = 0.0;
+    #endif
 
-	for (size_t i = 0; i < size)
+    uint32_t count = 0;
+    char* ptr = start_addr;
+    // printf("addr: %llu. size: %llu.\nCompression starts.\n", (unsigned long long) start_addr, size);
+	while (ptr < start_addr + size)
     {
-        s = clock();
+        #ifdef ENABLE_TIMING
+            s = clock();
+        #endif
         // read char
-        rc = Fread(&ch, sizeof(unsigned char), 1, infile);
-        if (rc == 0)
-        {
-            write_out(count, prev_ch);
-            break; // EOF
-        }
-        assert(rc == 1); // make sure only one char was read
-        e = clock();
-        read_time += (double) (e - s)/CLOCKS_PER_SEC;
+        ch = *ptr;
+        ptr++;
+        #ifdef ENABLE_TIMING
+            e = clock();
+            read_time += (double) (e - s)/CLOCKS_PER_SEC;
+        #endif
 
-        s = clock();
+        #ifdef ENABLE_TIMING
+            s = clock();
+        #endif
         // compress
-        if (count <= 0) // initialize
+        if (count == 0) // initialize
         {
             prev_ch = ch;
             count = 1;
@@ -94,43 +105,60 @@ void compress(int fd)
         }
         else // counter full, or new char
         {
+            #ifdef ENABLE_TIMING
             e = clock();
             compress_time += (double) (e - s)/CLOCKS_PER_SEC;
             s = clock();
-            write_out(count, prev_ch);
-            prev_ch = ch;
-            count = 1;
+            #endif
+            #ifdef ENABLE_TIMING
+            write_out(count, prev_ch, out);
             e = clock();
             write_time += (double) (e - s)/CLOCKS_PER_SEC;
+            #endif
+            prev_ch = ch;
+            count = 1;
         }
+        #ifdef ENABLE_TIMING
         e = clock();
         write_time += (double) (e - s)/CLOCKS_PER_SEC;
+        #endif
     }
 
-	// int munmap(void *addr, size_t length);
-	munmap(start_addr, size);
+    if (count > 0)
+        write_out(count, prev_ch, out);
 
-    FILE* stat = fopen(STATS_FILE, "w");
-    fprintf(stat, "read takes %f sec\n", read_time);
-    fprintf(stat, "compress take %f sec\n", compress_time);
-    fprintf(stat, "write take %f sec\n", write_time);
-    fclose(stat);
+
+	// int munmap(void *addr, size_t length);
+	int rc = munmap(start_addr, size);
+    assert(rc == 0);
+
+    #ifdef ENABLE_TIMING
+        fprintf(timing, "read takes %f sec\n", read_time);
+        fprintf(timing, "compress take %f sec\n", compress_time);
+        fprintf(timing, "write take %f sec\n", write_time);
+        fclose(timing);
+    #endif
+
+    #ifdef WRITE_TO_FILE
+        fclose(out);
+    #endif
 }
 
-void write_out(uint32_t count, unsigned char ch)
+void write_out(uint32_t count, unsigned char ch, FILE* out)
 {
-    #ifdef WRITE_READABLE
-        printf("%d%c", count, prev_ch);
+    #ifdef WRITE_TO_FILE
+        Fwrite(&count, sizeof(uint32_t), 1, out);
+        Fwrite(&ch, sizeof(unsigned char), 1, out);
     #else
         Fwrite(&count, sizeof(uint32_t), 1, stdout);
         Fwrite(&ch, sizeof(unsigned char), 1, stdout);
+        // printf("%d%c", count, prev_ch);
     #endif
 }
 
 size_t Fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
 {
-    size_t rc = fwrite(ptr, size, nmemb, stream);
-    return rc;
+    return fwrite(ptr, size, nmemb, stream);
 }
 
 size_t Fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
