@@ -8,7 +8,7 @@
 #include <sys/mman.h> // mmap
 
 
-#define WRITE_TO_FILE 0
+// #define WRITE_TO_FILE 0
 #define OUT_FILE "./unzip_out.txt"
 
 

@@ -11,7 +11,7 @@
 #define MAX_COUNT 0x80000000
 
 #define OUT_FILE "./zip_out.z"
-#define WRITE_TO_FILE 0
+// #define WRITE_TO_FILE 0
 
 void compress(int fd);
 void write_out(uint32_t count, unsigned char ch, FILE* out);
@@ -90,7 +90,9 @@ void compress(int fd)
     }
 
     if (count > 0) // last compressed unit hasn't been written out
+    {
         write_out(count, prev_ch, out);
+    }
 
 	rc = munmap(start_addr, size); // un-mmap the file
     assert(rc == 0);
