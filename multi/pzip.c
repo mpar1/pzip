@@ -1,0 +1,313 @@
+/*********************************************************
+ * Your Name:    Junrui Liu
+ * Partner Name: Shihan Zhao
+ *********************************************************/
+
+#include <stdio.h>
+#include <stdint.h> // portable int types
+#include <fcntl.h> // open
+#include <unistd.h> // close
+#include <assert.h> // assert
+#include <stdlib.h> // exit
+#include <sys/stat.h> // file stat
+#include <sys/mman.h> // mmap
+#include <pthread.h> // pthreads
+#include <math.h>   // ceil
+#include <sys/sysinfo.h> // get_nprocs
+
+#define MAX_COUNT (0x80000000) // 2^32 max count
+#define UNIT_SIZE 5 // 5 bytes per compressed unit
+#define CHUNCK_SIZE (0x100000) // 1MB chuncks
+#define BUF_N_SLOTS 1
+#define SLOT_SIZE (UNIT_SIZE * CHUNCK_SIZE)
+#define OUT_FILE "./zip_out.z"
+// #define WRITE_TO_FILE 0 // write to a file instead of stdout
+
+/* SLOTs for the circular buffer */
+#define SLOT_FREE 0     // default state
+#define SLOT_ASSIGNED 1
+#define SLOT_COMPRESSED 2
+
+typedef pthread_mutex_t lock_t;
+typedef pthread_cond_t cond_t;
+
+typedef struct __buf_t {
+    char* data;      // actual data buffer. initialized once and never modified
+    char* states;     // state can be {FREE, ASSIGN, COMPRESSED}
+    lock_t* locks;  // one state lock per buffer slot
+    cond_t* compressed; // C tells W that it finishes its slot
+    cond_t* freed;      // W tells C that the requested slot is free
+} buf_t;
+
+typedef struct __C_arg_t {
+    char* input_ptr;
+    char* input_end;
+    int start_chunck;
+    buf_t* buf;
+} C_arg_t;
+
+typedef struct __W_arg_t {
+    int last_chunck;
+    buf_t* buf;
+} W_arg_t;
+
+void work(int fd);
+uint64_t get_file_size(int fd);
+void write_to_buf(uint32_t count, char ch, char* ptr);
+void write_out(uint32_t count, char ch, FILE* out);
+void exit_if(int boolean, const char* msg);
+void* C(void *arg);
+void* W(void *arg);
+
+int main(int argc, const char* argv[])
+{
+    // take in a file name
+	exit_if(argc != 2, "please specify one and only one input file");
+	const char* filename = argv[1];
+    
+    // open the file
+	int fd = open(filename, O_RDONLY);
+	exit_if(fd < 0, "cannot open input file");
+
+	// actual work
+	work(fd);
+
+	// close the file
+    int rc = close(fd);
+    exit_if(rc != 0, "cannot close input file");
+}
+
+void* C(void *arg)
+{
+    C_arg_t* a = (C_arg_t *) arg;
+    char* input_ptr = a->input_ptr;
+    char* input_end = a->input_end;
+    int nth_chunck = a->start_chunck;
+    buf_t* buf = a->buf;
+    char* slot_ptr, *slot_end, *chunck_end;
+    
+    while (input_ptr < input_end)
+    {
+        int slot = nth_chunck % BUF_N_SLOTS; // current buffer slot
+        
+        // wait until this buffer slot is free
+        // TODO: eliminate this lock
+        pthread_mutex_lock ( &buf->locks[slot] );
+        while ( buf->states[slot] != SLOT_FREE )
+        {
+            pthread_cond_wait ( &buf->freed[slot], &buf->locks[slot] );
+        }
+        buf->states[slot] = SLOT_ASSIGNED; // mark this slot ASSIGNED
+        pthread_mutex_unlock ( &buf->locks[slot] );
+        
+        // slot is free. begin compressing
+        slot_ptr = buf->data + SLOT_SIZE * slot; // current pos in slot
+        slot_end = slot_ptr + SLOT_SIZE;
+        chunck_end = input_ptr + CHUNCK_SIZE;
+        
+        // compress a chunck of input data
+        char prev_ch = -1;
+        char ch;
+        uint32_t count = 0;
+        
+        while ( input_ptr < chunck_end )
+        {
+            ch = *input_ptr; // read char
+            input_ptr++;
+
+            // compress
+            if ( count == 0 ) // initialize
+            {
+                prev_ch = ch;
+                count = 1;
+            }
+            else if ( count < MAX_COUNT && ch == prev_ch ) // combo
+            {   count += 1;   }
+            else // counter full, or new char
+            {
+                write_to_buf (count, prev_ch, slot_ptr);
+                slot_ptr += UNIT_SIZE;
+                prev_ch = ch;
+                count = 1;
+            }
+        }
+        if ( count > 0 ) // last compressed unit hasn't been freed out
+        {
+            write_to_buf (count, prev_ch, slot_ptr);
+            slot_ptr += UNIT_SIZE;
+        }
+        // if slot is not full, write a (0,0) pair signaling EOF
+        if ( slot_ptr < slot_end )
+        {   write_to_buf (0, 0, slot_ptr);   }
+        
+        pthread_mutex_lock ( &buf->locks[slot] );
+        buf->states[slot] = SLOT_COMPRESSED; // mark this slot COMPRESSED
+        pthread_cond_signal ( &buf->compressed[slot]);
+        pthread_mutex_unlock ( &buf->locks[slot] ); // TODO: eliminate this unlock
+    }
+    return NULL;
+}
+
+void* W(void *arg)
+{
+    FILE* out;
+    #ifdef WRITE_TO_FILE
+        out = fopen(OUT_FILE, "w");
+        assert(out != NULL);
+    #else
+        out = stdout;
+    #endif
+    
+    /* unpack the args */
+    W_arg_t* a = (W_arg_t *) arg;
+    buf_t* buf = a->buf;
+    int last_chunck = a->last_chunck;
+    
+    /* uncompress */
+    int nth_chunck = 0;
+    char last_ch = 0;
+    uint32_t last_count = 0;
+    
+    while ( nth_chunck < last_chunck ) // TODO: <= ?
+    {
+        
+        int slot = nth_chunck % BUF_N_SLOTS;
+        // TODO: eliminate this lock
+        pthread_mutex_lock ( &buf->locks[slot] );
+        while ( buf->states[slot] != SLOT_COMPRESSED )
+        {
+            pthread_cond_wait ( &buf->compressed[slot], &buf->locks[slot] );
+        }
+        pthread_mutex_unlock ( &buf->locks[slot] );
+        
+        char* slot_ptr = buf->data + SLOT_SIZE * slot; // current pos in slot
+        char* slot_end = slot_ptr + SLOT_SIZE;
+        
+        while ( slot_ptr < slot_end )
+        {
+            uint32_t count = *(uint32_t *) slot_ptr;
+            slot_ptr += sizeof(uint32_t);
+            char ch = * slot_ptr;
+            if ( last_count == 0 ) // assumes a slot is non-empty
+            {
+                last_count = count;
+                last_ch = ch;
+            }
+            else if (count == 0) // EOF
+            {   break;  }
+            else
+            {   write_out(last_count, last_ch, out); }
+        }
+        nth_chunck++;
+
+        pthread_mutex_lock ( &buf->locks[slot] );
+        buf->states[slot] = SLOT_FREE; // mark this slot COMPRESSED
+        pthread_cond_signal ( &buf->freed[slot] );
+        // TODO: eliminate this unlock
+        pthread_mutex_unlock ( &buf->locks[slot] );
+    }
+    
+    if ( last_count != 0 )
+    {   write_out(last_count, last_ch, out); } // write out the last unit
+    
+    #ifdef WRITE_TO_FILE
+        rc = fclose(out);
+        assert(rc == 0);
+    #endif
+    return NULL;
+}
+
+void work(int fd)
+{
+    int rc = -1; // for return codes
+
+    /* mmap the file */
+    uint64_t file_size = get_file_size(fd);
+	char* start_addr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+    assert(start_addr != MAP_FAILED);
+
+    /* create a circular buffer */
+    buf_t buf;
+    
+    buf.data = malloc(BUF_N_SLOTS * UNIT_SIZE * sizeof(char)); // allocate data buffer
+    exit_if(buf.data == NULL, "cannot allocate data buffer");
+    buf.states = calloc(BUF_N_SLOTS, sizeof(char)); // each buffer slot has a state
+    exit_if(buf.states == NULL, "cannot allocate states buffer");
+    
+    for (int i = 0; i < BUF_N_SLOTS; i++) // initialize locks and cond vars
+    {
+        buf.locks[i] = (lock_t) PTHREAD_MUTEX_INITIALIZER;
+        buf.compressed[i] = (cond_t) PTHREAD_COND_INITIALIZER;
+        buf.freed[i] = (cond_t) PTHREAD_COND_INITIALIZER;
+    }
+
+    int free_cpu = get_nprocs(); // # of CPUs
+
+    pthread_t w;
+    /* create a W thread on standby */
+    {
+        W_arg_t args;
+        args.buf = &buf;
+        args.last_chunck = (int) ceil ( (double) file_size / (double) CHUNCK_SIZE );
+        
+        rc = pthread_create(&w, NULL, W, &args);
+        exit_if(rc != 0, "cannot create writer thread");
+        
+        free_cpu--; // W occupies a cpu
+    }
+
+    /* create (N-1) C threads, where N = # of CPUs */
+    pthread_t compressors[free_cpu];
+    for (int i = 0; i < free_cpu; i++)
+    {
+        /* args for C */
+        C_arg_t args; // how would the compiler translate this line? Safe?
+        
+        args.input_ptr = start_addr + i * CHUNCK_SIZE;
+        args.input_end = start_addr + file_size;
+        args.start_chunck = i;
+        args.buf = &buf;
+
+        rc = pthread_create(&compressors[i], NULL, C, &args);
+        exit_if(rc != 0, "cannot create compressor thread");
+    }
+
+    /* wait for the W thread to finish */
+    pthread_join(w, (void **) &rc); // this implies that the C threads have finished
+
+    /* cleaning */
+    free(buf.data);
+    free(buf.states);
+    rc = munmap(start_addr, file_size); // un-mmap the file
+    exit_if(rc =! 0, "cannot un-mmap input file");
+}
+
+uint64_t get_file_size(int fd)
+{
+	struct stat stat_buf;
+    fstat(fd, &stat_buf);
+    return stat_buf.st_size;
+}
+
+void write_to_buf(uint32_t count, char ch, char* ptr)
+{
+    *(uint32_t *) ptr = count;
+    ptr++;
+    ptr = (char *) ptr;
+    *ptr = ch;
+}
+
+void write_out(uint32_t count, char ch, FILE* out)
+{
+    fwrite(&count, sizeof(uint32_t), 1, out);
+    fwrite(&ch, sizeof(char), 1, out);
+}
+
+void exit_if(int boolean, const char* msg)
+{
+    if (boolean)
+    {
+        fprintf(stderr, "%s", msg);
+        exit(1);
+    }
+}
