@@ -12,7 +12,6 @@
 #include <sys/stat.h> // file stat
 #include <sys/mman.h> // mmap
 #include <pthread.h> // pthreads
-#include <semaphore.h> // semaphores
 #include <math.h>   // ceil
 #include <sys/mman.h> // madvise 
 #include <sys/sysinfo.h> // get_nprocs
@@ -23,26 +22,32 @@
  *                      Constants
  *********************************************************/
 
-/* macro functions */
-#define MIN(a,b) (((a)<(b))?(a):(b))
-#define MAX(a,b) (((a)>(b))?(a):(b))
-
-/* constants. DO NOT change them */
+// constants. do not change these
 #define MAX_COUNT (1 << 31) // 2^32 max count
 #define UNIT_SIZE 5 // 5 bytes per compressed unit
 
-/* parameters. modify as you want */
-#define CHUNCK_SIZE (1024*1024*50) // 50MB chuncks
+// parameters
+#define CHUNCK_SIZE (1024*1024) // 10MB chuncks
 #define BYTES_PER_SLOT ((UNIT_SIZE) * (CHUNCK_SIZE))
-// #define N_CPUS 3 // uncomment this to force # of cores
+// #define N_CPUS 3
 #define SLOT_PER_CPU 1
 
 /* output behaviors */
 #define WRITE_TO_STD 0
+#define OUT_FILE "./out"
 // #define WRITE_TO_FILE 0 // write to a file instead of stdout
-// #define OUT_FILE "./out"
 
-/* debugging behaviors */
+
+/* Slot state constants for the circular buffer */
+#define SLOT_FREE 0     // default state
+#define SLOT_COMPRESSED 1
+
+
+#define MIN(a,b) (((a)<(b))?(a):(b))
+#define MAX(a,b) (((a)>(b))?(a):(b))
+
+/* for debugging */
+
 #define print_flow do_nothing
 #define print_pre do_nothing
 #define print_write do_nothing
@@ -55,19 +60,24 @@
  *                   Type Declarations
  *********************************************************/
 
+typedef pthread_mutex_t lock_t;
+typedef pthread_cond_t cond_t;
+
 /* circular buffer */
 typedef struct __buf_t {
+    char* states;     // state can be one of {FREE, ASSIGN, COMPRESSED}
     char** data;      // actual data buffer
-    sem_t* compressed; // C tells W that it finishes compressing its slot
-    sem_t* freed;      // W tells C that the requested slot is free
+    cond_t* compressed; // C tells W that it finishes compressing its slot
+    cond_t* freed;      // W tells C that the requested slot is free
+    lock_t* locks;      // 1 lock per slot to control state and cond var
     int n_slots;       // # of slots
 } buf_t;
 
 /* args to C threads */
 typedef struct __C_arg_t {
     char* file_start;
-    char* file_end;
-    buf_t* buf;
+    char* file_end; // end of the input file
+    buf_t* buf;      // buffer struct
     int id;          // between 0 and n_slots
     int compressors; // # of C threads
 } C_arg_t;
@@ -77,7 +87,6 @@ typedef struct __W_arg_t {
     int n_chuncks;
     buf_t* buf;
 } W_arg_t;
-
 
 /*********************************************************
  *                 Function Declarations
@@ -90,13 +99,12 @@ uint64_t get_file_size(int fd);
 void write_to_buf(uint32_t count, char ch, char* ptr);
 void write_out(uint32_t count, char ch, FILE* out);
 void exit_if(int boolean, const char* msg);
+void print_states(char* states, int n_slots);
 void do_nothing(const char* s, ...); // to substitute printf
 
-/* for debugging */
 char* data_base;
 char* data_end;
 char* base;
-
 
 /*********************************************************
  *                          Main
@@ -131,23 +139,35 @@ void* C(void *arg)
     buf_t* buf = a.buf;
     int n_slots = buf->n_slots;
 
-    int chunck_i = a.id;
+    int nth_chunck = a.id;
     char* input_ptr = file_start + id * CHUNCK_SIZE;
     while (input_ptr < file_end)
     {
-        int slot = chunck_i % n_slots; // current buffer slot
+        int slot = nth_chunck % n_slots; // current buffer slot
+        // print_flow("%d  now reading %d-th chunck. %p : %p : %p\n", id, nth_chunck, input_ptr, input_ptr + CHUNCK_SIZE, input_end);
+        // print_flow("%d  slot: %d\n", id, slot);
         
         /* wait until this buffer slot is free */
-        print_flow("%d  (%d, %d). wait  W.\n", id, chunck_i, slot);
-        sem_wait ( &buf->freed[slot] );
-        print_flow("%d  (%d, %d). begin C.\n", id, chunck_i, slot);
+        pthread_mutex_lock ( &buf->locks[slot] );
+        print_pre("before ");
+        print_states(buf->states, n_slots);
+        print_flow("%d  (%d, %d). wait  W.\n", id, nth_chunck, slot);
+        while ( buf->states[slot] != SLOT_FREE )
+        {
+            pthread_cond_wait ( &buf->freed[slot], &(buf->locks[slot]) );
+        }
+        print_flow("%d  (%d, %d). begin C.\n", id, nth_chunck, slot);
+
+        print_pre("after ");
+        print_states(buf->states, n_slots);
+        pthread_mutex_unlock ( &(buf->locks[slot]) );
 
         /* slot is free. begin compressing */
         char* slot_ptr = buf->data[slot]; // current pos in slot
         char* slot_end = slot_ptr + BYTES_PER_SLOT;
         char* chunck_end = MIN(input_ptr + CHUNCK_SIZE, file_end);
-        print_flow("%d  chunck_i: %d, input_ptr: %lu, slot_ptr: %lu/%lu\n",
-        id, chunck_i, (input_ptr - file_start), slot_ptr-data_base, data_end-data_base);
+        print_flow("id:%d, nth_chunck: %d, input_ptr: %lu, slot_ptr: %lu/%lu\n",
+        id, nth_chunck, (input_ptr - file_start), slot_ptr-data_base, data_end-data_base);
 
         /* compress a chunck of input data */
         madvise(input_ptr, CHUNCK_SIZE, MADV_SEQUENTIAL);
@@ -180,17 +200,25 @@ void* C(void *arg)
             write_to_buf (count, prev_ch, slot_ptr);
             slot_ptr += UNIT_SIZE;
         }
-        // if slot is not full, write a (0,0) pair that signals an EOF
+        // if slot is not full, write a (0,0) pair signaling EOF
         if ( slot_ptr < slot_end )
         {   write_to_buf (0, 0, slot_ptr);   }
 
-        // tell W that job is done
-        print_flow("%d  (%d, %d). done  C.\n", id, chunck_i, slot);
-        sem_post ( &buf->compressed[slot]);
+        /* tell W that job is done */
+        pthread_mutex_lock ( &(buf->locks[slot]) );
+        print_pre("before ");
+        print_states(buf->states, n_slots);
+        buf->states[slot] = SLOT_COMPRESSED; // mark this slot COMPRESSED
 
-        // go to the next chunck
+        print_flow("%d  (%d, %d). done  C.\n", id, nth_chunck, slot);
+        print_pre("after ");
+        print_states(buf->states, n_slots);
+        pthread_mutex_unlock ( &(buf->locks[slot]) ); // TODO: eliminate this unlock;
+        pthread_cond_signal ( &buf->compressed[slot]);
+
+        /* go to the next chunck */
         input_ptr += CHUNCK_SIZE * (compressors - 1);
-        chunck_i += compressors; 
+        nth_chunck += compressors; 
     }
     print_flow("%d  return.\n", id);
     return 0;
@@ -213,19 +241,24 @@ void* W(void *arg)
     buf_t* buf = a.buf;
     int n_slots = buf->n_slots;
 
-    /* transfer data from buffer to output file */
-    int chunck_i = 0;
+    /* uncompress */
+    int nth_chunck = 0;
     char last_ch = 0; // buffer a unit, in case combos onto the next chunck
     uint32_t last_count = 0;
 
-    while ( chunck_i < n_chuncks )
+    while ( nth_chunck < n_chuncks )
     {
-        int slot = chunck_i % n_slots;
+        int slot = nth_chunck % n_slots;
 
         /* wait for C to compress this chunck */
-        print_flow("-  <%d, %d>. wait  C.\n", chunck_i, slot);
-        sem_wait ( &buf->compressed[slot] );
-        print_flow("-  <%d, %d>. begin W.\n", chunck_i, slot);
+        print_flow("-  <%d, %d>. wait  C.\n", nth_chunck, slot);
+        pthread_mutex_lock ( &buf->locks[slot] );
+        while ( buf->states[slot] != SLOT_COMPRESSED )
+        {
+            pthread_cond_wait ( &buf->compressed[slot], &buf->locks[slot] );
+        }
+        print_flow("-  <%d, %d>. begin W.\n", nth_chunck, slot);
+        pthread_mutex_unlock ( &buf->locks[slot] );
 
         /* good to go */
         char* slot_ptr = buf->data[slot]; // current pos in slot
@@ -274,11 +307,14 @@ void* W(void *arg)
             }
         }
 
-        // tell C that this slot is free
-        print_flow("-  <%d, %d>. done  W.\n", chunck_i, slot);
-        sem_post ( &buf->freed[slot] );
+        /* tell C that this slot is free */
+        pthread_mutex_lock ( &buf->locks[slot] );
+        buf->states[slot] = SLOT_FREE; // mark this slot COMPRESSED
+        pthread_mutex_unlock ( &buf->locks[slot] );
+        pthread_cond_signal ( &buf->freed[slot] );
+        print_flow("-  <%d, %d>. done  W.\n", nth_chunck, slot);
 
-        chunck_i++; // move on to next chunck (and slot)
+        nth_chunck++; // move on to next chunck (and slot)
     }
     
     if ( last_count != 0 )
@@ -301,7 +337,7 @@ void work(int fd)
 	char* start_addr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
     assert(start_addr != MAP_FAILED);
 
-    int n_chuncks = (int) ceil (file_size * 1.0 / CHUNCK_SIZE);
+    double n_chuncks = ceil (file_size * 1.0 / CHUNCK_SIZE);
     print_flow("file size %lu, chunck size: %d, div: %d\n", file_size, CHUNCK_SIZE, n_chuncks);
 
     /* create a circular buffer */
@@ -309,13 +345,13 @@ void work(int fd)
 
     int cpu_cores; // scale # of slots according to # of cpu cores
     cpu_cores = 
-        #ifdef N_CPUS // if we have specified the parameter, use that
-            N_CPUS;
-        #else
-            get_nprocs();
-        #endif
+    #ifdef N_CPUS // if we have specified the parameter, use that
+        N_CPUS;
+    #else
+        get_nprocs();
+    #endif
 
-    int n_slots = (int) ceil ((cpu_cores-1) * SLOT_PER_CPU); // 1 core reserved for W
+    int n_slots = (int) ((cpu_cores-1) * SLOT_PER_CPU); // 1 core reserved for W
     buf.n_slots = n_slots;
     
     buf.data = malloc(n_slots * sizeof(char*)); // slot ptrs
@@ -325,28 +361,32 @@ void work(int fd)
         exit_if(buf.data[i] == NULL, "cannot allocate buffer slots");
     }
     
-    buf.compressed = malloc(n_slots * sizeof(sem_t));
+    buf.states = calloc(n_slots, sizeof(char)); // each slot has a state
+        exit_if(buf.states == NULL, "cannot allocate states buffer");
+    buf.locks = malloc(n_slots * sizeof(lock_t));
+        exit_if(buf.locks == NULL, "cannot allocate locks");
+    buf.compressed = malloc(n_slots * sizeof(cond_t));
         exit_if(buf.compressed == NULL, "cannot allocate compressed (cond var) array");
-    buf.freed = malloc(n_slots * sizeof(sem_t));
+    buf.freed = malloc(n_slots * sizeof(cond_t));
         exit_if(buf.freed == NULL, "cannot allocate freed (cond var) array");
 
     for (int i = 0; i < n_slots; i++) // initialize cond vars
     {
-        rc = sem_init(&buf.compressed[i], 0, 0);
-        rc |= sem_init(&buf.freed[i], 0, 1);
-        exit_if(rc != 0, "cannot init semaphore");
+        buf.locks[i] = (lock_t) PTHREAD_MUTEX_INITIALIZER;
+        buf.compressed[i] = (cond_t) PTHREAD_COND_INITIALIZER;
+        buf.freed[i] = (cond_t) PTHREAD_COND_INITIALIZER;
     }
 
-    // DEBUG printing start
+    // DEBUG start
+    base = MIN((char*) buf.data, (char*) buf.states);
+    base = MIN(base, (char*) buf.locks);
     base = MIN(base, (char*) buf.compressed);
     base = MIN(base, (char*) buf.freed);
     data_base = buf.data[0];
     data_end = buf.data[0];
 
-    print_flow("data: %lu\tcompressed: %lu\tfreed: %lu\n",
-        (char*) buf.data - base,
-        (char*) buf.compressed-base,
-        (char*) buf.freed-base);
+    print_flow("data: %lu\tstates: %lu\n", (char*)buf.data-base, (char*) buf.states-base);
+    print_flow("locks: %lu\tcompressed: %lu\tfreed: %lu\n", (char*) buf.locks-base, (char*) buf.compressed-base, (char*) buf.freed-base);
     
     for (int i = 0; i < n_slots; i++)
     {
@@ -359,9 +399,9 @@ void work(int fd)
         print_flow("data[%d]: %lu\n", i, buf.data[i]-data_base);
     }
     print_flow("data ends at: %lu\n", data_end-data_base);
-    // DEBUG printing end
+    // DEBUG end
 
-    /* create C threads */
+    /* create compressor threads */
     int compressors = cpu_cores - 1; // since W occupies a cpu core
     pthread_t c_threads[compressors];
     C_arg_t cargs[compressors];
@@ -383,14 +423,13 @@ void work(int fd)
 
     W_arg_t wargs; // args to W
     wargs.buf = &buf;
-    wargs.n_chuncks = n_chuncks;
+    wargs.n_chuncks = (int) n_chuncks;
     rc = pthread_create(&w, NULL, W, &wargs);
     exit_if(rc != 0, "cannot create writer thread");
 
 
     /* wait for the W thread to finish */
     pthread_join(w, (void **) &rc); // this implies that the C threads have finished
-    // // wait for C threads to finish. no need to do so
     // for (int i = 0; i < compressors; i++)
     // {
     //     pthread_join(c_threads[i], (void **) &rc);
@@ -409,6 +448,8 @@ void work(int fd)
         print_flow("compressed freed\n");
     free(buf.freed);
         print_flow("freed freed\n");
+    free(buf.states);
+        print_flow("states freed\n");
 }
 
 uint64_t get_file_size(int fd)
@@ -451,6 +492,24 @@ void exit_if(int boolean, const char* msg)
         fprintf(stderr, "%s", msg);
         exit(1);
     }
+}
+
+void print_states(char* states, int n_slots)
+{
+#ifdef ENABLE_PRINT_STATES
+    printf("states:[");
+    for (int i = 0; i < n_slots; i++)
+    {
+        switch (states[i])
+        {
+            case SLOT_COMPRESSED: printf("c, "); break;
+            case SLOT_FREE: printf("f, "); break;
+            default: exit_if(1, "no such state");
+        }
+        
+    }
+    printf("]\n");
+#endif
 }
 
 void do_nothing(const char* s, ...)
