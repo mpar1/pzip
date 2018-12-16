@@ -11,7 +11,6 @@
 // #define WRITE_TO_FILE 0
 #define OUT_FILE "./unzip_out.txt"
 
-
 /* decompress the characters from a given input file stream */
 void decompress(int fd);
 uint64_t get_file_size(int fd);
@@ -56,9 +55,8 @@ void decompress(int fd)
     char* ptr = start_addr;
     while (ptr < start_addr + size)
     {
-        count = *ptr + (*(ptr+1) << 8) + (*(ptr+2) << 16) + 
-                       (*(ptr+3) << 24);
-        ch = *(ptr+4);
+        count = *((uint32_t*) ptr);
+        ch = *(ptr + 4);
         ptr += 5;
     
         for (uint32_t i = 0; i < count; i++) // decompress
